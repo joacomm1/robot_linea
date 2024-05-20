@@ -1,0 +1,239 @@
+from controller import Robot, DistanceSensor, Motor
+import numpy as np
+import math
+from time import sleep
+
+MAX_SPEED = 6.28  # [rad/s] define la máxima velocidad de los motores
+
+# Crea una instancia del robot
+robot = Robot()
+i = 0
+contador = 0
+tiempo_por_iteracion = 1000
+# Intervalo discreto por cada paso de simulación del mundo (world) en ms
+timestep = int(robot.getBasicTimeStep())   # [ms]
+delta_t = timestep / 1000.0    # [s] # cambio a unidades de [s]
+
+# Estados (states)
+states = ['GoToGoal', 'Stop']  # lista de todos los estados que tiene la máquina de estados
+current_state = states[0]  # Define cuál será el estado en el que partirá el robot
+
+# Contador (counter): algunos estados estarán activos por un tiempo que se puede definir a través de counter
+counter = 0
+COUNTER_MAX = 5  # jugar con este valor para ver que conviene
+
+objetivos = [[0, 0],[0.48,0.33]]
+
+# Robot pose
+# Ajustar a los valores iniciales que se encuentran en la consola de la simulación Webots
+# Posición y orientación
+x = 0.00    # posición en x [m]
+y = 0.44    # posición en y [m]
+phi = 0.0   # orientación [rad]
+
+# Velocidad en los ejes. Se irá actualizando a medida que midamos los encoders
+dx = 0.0   # velocidad en x [m/s]
+dy = 0.0   # velocidad en y [m/s]
+
+# Velocidad angular de las ruedas, basado en los resultados de los encoders
+wl = 0.0    # Velocidad angular rueda izquierda (l de left)  [rad/s]
+wr = 0.0    # Velocidad angular rueda derecha   (r de right) [rad/s]
+
+# Velocidad lineal (en el eje x del robot) y angular
+u = 0.0    # velocidad lineal  [m/s]
+w = 0.0    # velocidad angular [rad/s]
+
+# Parámetros físicos del e-puck (robot diferencial)
+R = 0.0205    # Radio Ruedas: 20.5mm [m]
+D = 0.0565    # Distancia entre ruedas: 52mm [m]
+
+e_prev_phi = 0
+e_acc_phi = 0
+kp_phi = 0.5
+kd_phi = 0.1
+ki_phi = 0.1
+
+# -------------------------------------------------------
+# Inicializar los dispositivos
+
+# Sensores de proximidad en el suelo
+gs = []
+gsNames = ['gs0', 'gs1', 'gs2']  # hay solamente 3 en este robot
+for i in range(3):
+    gs.append(robot.getDevice(gsNames[i]))  # Agrega los 3 sensores en gs
+    gs[i].enable(timestep)  # los habilita
+
+# Encoders: Para la odometría ahora necesitamos esta info
+encoder = []
+encoderNames = ['left wheel sensor', 'right wheel sensor']
+for i in range(2):
+    encoder.append(robot.getDevice(encoderNames[i]))
+    encoder[i].enable(timestep)
+
+oldEncoderValues = []  # aquí almacenaremos el valor antiguo de los encoders
+
+# Motores
+leftMotor = robot.getDevice('left wheel motor')  # similar a los sensores, pero ahora con los motores (actuadores)
+rightMotor = robot.getDevice('right wheel motor')
+leftMotor.setPosition(float('inf'))
+rightMotor.setPosition(float('inf'))
+leftMotor.setVelocity(0.0)
+rightMotor.setVelocity(0.0)
+
+# Funciones para poder calcular la posición, están basadas en las ecuaciones vistas en clases
+def get_wheels_speed(encoderValues, oldEncoderValues, delta_t):
+    # Calcula la velocidad angular de las ruedas en [rad/s]
+    wl = (encoderValues[0] - oldEncoderValues[0]) / delta_t
+    wr = (encoderValues[1] - oldEncoderValues[1]) / delta_t
+    return wl, wr
+
+def get_robot_speeds(wl, wr, r, d):
+    # Velocidad lineal (u) y angular(w)
+    u = (r * wl / 2) + (r * wr / 2)
+    w = (r * wr / d) - (r * wl / d)
+    return u, w
+
+def get_robot_pose(u, w, x_old, y_old, phi_old, delta_t):
+    # Calcula posición y orientación en el eje global
+    delta_phi = w * delta_t
+    phi = phi_old + delta_phi
+    
+    if phi >= np.pi:
+        phi = phi - 2 * np.pi
+    elif phi < -np.pi:
+        phi = phi + 2 * np.pi
+    x = x_old + np.cos(phi) * u * delta_t
+    y = y_old + np.sin(phi) * u * delta_t
+   
+    return x, y, phi
+
+def calculo_error(x, y, objetivo):
+    objetivo_x = objetivo[0]
+    objetivo_y = objetivo[1]
+    return math.sqrt(((objetivo_x - x) ** 2) + ((objetivo_y - y) ** 2))
+
+def calculo_angulo(x1, y1, punto):
+    # Calcular la diferencia entre las coordenadas
+    dx = punto[0] - x1
+    dy = punto[1] - y1
+    
+    # Calcular el ángulo usando atan2 y convertirlo a grados
+    angulo_radianes = math.atan2(dy, dx)
+    
+    return angulo_radianes
+
+def pid_controller(e, e_prev, e_acc, delta_t, kp=1.0, kd=0, ki=0):
+    """ PID algoritmo: debe ejecutarse cada delta_t segundos
+    El error e debe calcularse como: e = desired_value - actual_value
+    e_prev contiene el error calculado en el paso anterior.
+    e_acc contiene el término de integración (acumulación).
+    """
+    P = kp * e                      # Término proporcional; kp es la ganancia proporcional
+    I = e_acc + ki * e * delta_t    # Término integral; ki es la ganancia integral
+    D = kd * (e - e_prev) / delta_t # Término derivativo; kd es la ganancia derivativa
+
+    output = P + I + D              # Salida del controlador
+
+    # Guardar valores para la siguiente iteración
+    e_prev = e     # Valor de error en la iteración anterior (para calcular el término derivativo)
+    e_acc = I      # Valor de error acumulado (para calcular el término integral)
+
+    return output, e_prev, e_acc
+
+# -------------------------------------------------------
+# Bucle principal
+while robot.step(timestep) != -1:
+    contador += robot.getBasicTimeStep()
+    
+
+    # Actualizar lecturas de los sensores
+    gsValues = []
+    for i in range(3):
+        gsValues.append(gs[i].getValue())
+
+    encoderValues = []
+    for i in range(2):
+        encoderValues.append(encoder[i].getValue())    # [rad]
+
+    # Opción para imprimir los valores de cada encoder
+    #for indice, valor in enumerate(encoderValues):
+        #print("encoder ", indice, "valor ", valor)
+
+    # Imprimir la velocidad de las ruedas
+    #left_wheel_speed = leftMotor.getVelocity()
+    #right_wheel_speed = rightMotor.getVelocity()
+    #print("Left wheel speed:", left_wheel_speed, "rad/s")
+    #print("Right wheel speed:", right_wheel_speed, "rad/s")
+    #print(f'wl: {wl}')
+    #print(f'wr: {wr}')
+    #print(f'step time: {delta_t}')
+
+    # Actualizar los valores antiguos del encoder si no se ha hecho antes
+    if len(oldEncoderValues) < 2:
+        for i in range(2):
+            oldEncoderValues.append(encoder[i].getValue())
+
+    # Calcular error de ángulo
+    error_angulo = calculo_angulo(x, y, objetivos[0]) - phi
+    print("Error de ángulo:", error_angulo)
+    
+    if objetivos:
+        current_state = states[0]
+        
+    if current_state == 'GoToGoal':
+        # Aplicar el controlador PID para corregir el ángulo
+        
+        #if contador >= tiempo_por_iteracion:
+            
+            pid_output, e_prev_phi, e_acc_phi = pid_controller(error_angulo, e_prev_phi, e_acc_phi, delta_t, kp_phi, kd_phi, ki_phi)
+            contador = 0
+        # Controlar las velocidades de las ruedas basado en la salida del PID
+            leftSpeed = 2 -pid_output
+            rightSpeed = 4 + pid_output
+
+    # Condición para el estado de parada
+    error_posicion = calculo_error(x, y, objetivos[0])
+    print(error_posicion)
+    if error_posicion < 0.05:
+        current_state=states[1]
+    if ((objetivos[0][0] - 0.05) <= x <= (objetivos[0][0] + 0.05) and (objetivos[0][1] - 0.05) <= y <= (objetivos[0][1] + 0.05)):
+        print("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAa")
+        current_state = states[1]
+
+    if current_state == 'Stop':
+        leftSpeed = 0
+        rightSpeed = 0
+        leftMotor.setVelocity(leftSpeed)
+        rightMotor.setVelocity(rightSpeed)
+        pause_steps = int(5 / (timestep / 1000.0))  # calcular número de pasos para 5 segundos
+        for _ in range(pause_steps):
+            robot.step(timestep)
+        objetivos.pop(0)
+        e_prev_phi = 0
+        e_acc_phi = 0
+        kp_phi = 0.5
+        kd_phi = 0.1
+        ki_phi = 0.1
+    print(objetivos[0])
+    # Localización del robot
+
+    # Calcular la velocidad de las ruedas
+    wl, wr = get_wheels_speed(encoderValues, oldEncoderValues, delta_t)
+
+    # Calcular velocidad lineal y angular
+    u, w = get_robot_speeds(wl, wr, R, D)
+
+    # Calcular la nueva posición del robot
+    x, y, phi = get_robot_pose(u, w, x, y, phi, delta_t)
+
+    # Actualizar el valor del encoder para el próximo ciclo
+    oldEncoderValues = encoderValues
+
+    # Incrementar el contador
+    counter += 1
+    # Ayuda para depuración        
+    print(f'Sim time: {robot.getTime():.3f}  Pose: x={x:.5f} m, y={y:.5f} m, phi={phi:.5f} rad.')  
+
+    # Fijar la velocidad de los motores que asignamos en las máquinas de estado
+    leftMotor.setVelocity(leftSpeed)
+    rightMotor.setVelocity(rightSpeed)
